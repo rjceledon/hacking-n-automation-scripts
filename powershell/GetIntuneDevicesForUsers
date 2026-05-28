@@ -1,0 +1,91 @@
+# rjceledon
+# 05/28/2026
+
+# === CONFIG ===
+$InputCsv  = "C:\Temp\users.csv"
+$OutputCsv = "C:\Temp\IntuneDevices_Report.csv"
+
+# === MODULES ===
+if (-not (Get-Module -ListAvailable Microsoft.Graph.DeviceManagement)) {
+    Install-Module Microsoft.Graph.DeviceManagement -Scope CurrentUser -Force
+}
+if (-not (Get-Module -ListAvailable Microsoft.Graph.Users)) {
+    Install-Module Microsoft.Graph.Users -Scope CurrentUser -Force
+}
+Import-Module Microsoft.Graph.DeviceManagement
+Import-Module Microsoft.Graph.Users
+
+# === CONNECT ===
+if (-not (Get-MgContext)) {
+    Connect-MgGraph -Scopes "DeviceManagementManagedDevices.Read.All","User.Read.All" -UseDeviceAuthentication -NoWelcome
+}
+
+# === LOAD CSV ===
+$users = Import-Csv -Path $InputCsv | ForEach-Object {
+    $upn = $_.UserPrincipalName
+    if (-not $upn) { $upn = $_.'User principal name' }
+    if ($upn) { $upn.Trim() }
+} | Where-Object { $_ }
+
+$total   = $users.Count
+$results = New-Object System.Collections.Generic.List[object]
+$batchSize = 20
+$batches   = [Math]::Ceiling($total / $batchSize)
+
+Write-Host "`nProcessing $total users in $batches batch(es) of $batchSize...`n" -ForegroundColor Cyan
+
+for ($b = 0; $b -lt $batches; $b++) {
+    $chunk = $users[($b * $batchSize)..([Math]::Min(($b + 1) * $batchSize - 1, $total - 1))]
+    $pct   = [int]((($b + 1) / $batches) * 100)
+    Write-Progress -Activity "Batch querying Intune" -Status "Batch $($b+1) of $batches" -PercentComplete $pct
+
+    # Build batch payload — id maps back to UPN
+    $requests = @()
+    for ($i = 0; $i -lt $chunk.Count; $i++) {
+        $upn = $chunk[$i]
+        $encoded = [uri]::EscapeDataString($upn)
+        $requests += [PSCustomObject]@{
+            id     = "$i"
+            method = "GET"
+            url    = "/deviceManagement/managedDevices?`$filter=userPrincipalName eq '$encoded'&`$select=deviceName,userPrincipalName,userDisplayName,emailAddress,manufacturer,operatingSystem,osVersion"
+        }
+    }
+    $body = @{ requests = $requests } | ConvertTo-Json -Depth 5
+
+    try {
+        $resp = Invoke-MgGraphRequest -Method POST -Uri "https://graph.microsoft.com/v1.0/`$batch" -Body $body -ContentType "application/json"
+
+        foreach ($r in $resp.responses) {
+            $upn = $chunk[[int]$r.id]
+            if ($r.status -eq 200 -and $r.body.value.Count -gt 0) {
+                foreach ($d in $r.body.value) {
+                    $results.Add([PSCustomObject]@{
+                        ActiveUserName     = $d.userDisplayName
+                        AssignedDeviceName = $d.deviceName
+                        UserUPN            = $d.userPrincipalName
+                        UserEmail          = $d.emailAddress
+                        DeviceManufacturer = $d.manufacturer
+                        DeviceOS           = "$($d.operatingSystem) $($d.osVersion)"
+                    })
+                    Write-Host "  [OK]  $upn -> $($d.deviceName)" -ForegroundColor Green
+                }
+            } elseif ($r.status -eq 200) {
+                $results.Add([PSCustomObject]@{
+                    ActiveUserName="";AssignedDeviceName="NO DEVICE FOUND";UserUPN=$upn;UserEmail="";DeviceManufacturer="";DeviceOS=""
+                })
+                Write-Host "  [--]  $upn -> no devices" -ForegroundColor Yellow
+            } else {
+                Write-Host "  [ERR] $upn -> HTTP $($r.status)" -ForegroundColor Red
+                $results.Add([PSCustomObject]@{
+                    ActiveUserName="";AssignedDeviceName="ERROR $($r.status)";UserUPN=$upn;UserEmail="";DeviceManufacturer="";DeviceOS=""
+                })
+            }
+        }
+    } catch {
+        Write-Host "  [BATCH ERR] $($_.Exception.Message)" -ForegroundColor Red
+    }
+}
+
+Write-Progress -Activity "Batch querying Intune" -Completed
+$results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
+Write-Host "`nDone. $($results.Count) rows -> $OutputCsv" -ForegroundColor Cyan
